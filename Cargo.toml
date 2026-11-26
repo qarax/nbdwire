@@ -1,0 +1,24 @@
+[package]
+name = "nbdwire"
+version = "0.1.0"
+edition = "2024"
+description = "An async server for the NBD (Network Block Device) protocol"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/qarax/nbdwire"
+readme = "README.md"
+keywords = ["nbd", "network-block-device", "block-device", "storage", "tokio"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+rustix = { version = "1.1.6", features = ["fs"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["io-util", "rt"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+rcgen = "0.14.10"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "process", "io-util"] }
