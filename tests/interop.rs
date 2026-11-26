@@ -38,8 +38,9 @@ fn uri(socket: &Path) -> String {
 }
 
 fn export(path: &Path, access: Access) -> Server {
-    let backend = FileBackend::open(path, access).unwrap();
-    Server::new().export("disk", Arc::new(backend))
+    let server = Server::new();
+    server.export("disk", Arc::new(FileBackend::open(path, access).unwrap()));
+    server
 }
 
 /// Runs a client and returns what it printed, failing the test if it fails.
@@ -200,8 +201,11 @@ async fn tls_is_required() {
     sparse_image(&image);
     let certs = dir.path().join("certs");
     std::fs::create_dir(&certs).unwrap();
-    let backend = FileBackend::open(&image, Access::ReadOnly).unwrap();
-    let server = Server::with_tls(common::tls(&certs)).export("disk", Arc::new(backend));
+    let server = Server::with_tls(common::tls(&certs).acceptor);
+    server.export(
+        "disk",
+        Arc::new(FileBackend::open(&image, Access::ReadOnly).unwrap()),
+    );
     let socket = serve(server, dir.path());
 
     let tls_uri = format!(

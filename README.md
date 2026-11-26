@@ -19,7 +19,8 @@ use nbdwire::{Access, FileBackend, Server};
 
 # async fn run() -> std::io::Result<()> {
 let disk = FileBackend::open("disk.img", Access::ReadOnly)?;
-let server = Arc::new(Server::new().export("disk", Arc::new(disk)));
+let server = Arc::new(Server::new());
+server.export("disk", Arc::new(disk));
 let listener = tokio::net::UnixListener::bind("/run/disk.sock")?;
 loop {
     let (stream, _) = listener.accept().await?;
@@ -34,6 +35,27 @@ $ nbdinfo --map 'nbd+unix:///disk?socket=/run/disk.sock'
          0     1048576    0  data
    1048576     3145728    3  hole,zero
 ```
+
+## Client
+
+`Client` reads an export, from nbdwire's server or any other NBD server, over
+any stream, starting TLS first with `Client::connect_tls`. `copy_to` copies the
+whole export to a file, asking the server where its data is (block status) and
+leaving its holes as holes:
+
+```rust,no_run
+use nbdwire::Client;
+
+# async fn run() -> Result<(), nbdwire::ClientError> {
+let stream = tokio::net::UnixStream::connect("/run/disk.sock").await?;
+let mut client = Client::connect(stream, "disk").await?;
+let copied = client.copy_to(std::fs::File::create("copy.img")?).await?;
+client.disconnect().await?;
+# Ok(())
+# }
+```
+
+It sends one request at a time, and only reads: no writes yet.
 
 ## Protocol support
 
@@ -51,9 +73,10 @@ connections at once (`NBD_FLAG_CAN_MULTI_CONN`), which clients such as
 
 ## Tests
 
-`cargo test` runs the server against clients it shares no code with: libnbd's
-`nbdinfo` and `nbdcopy`, and QEMU's `qemu-img` and `qemu-io`. Install them
-first; on Debian and Ubuntu that is `apt install libnbd-bin qemu-utils`.
+`cargo test` runs the server against clients it shares no code with (libnbd's
+`nbdinfo` and `nbdcopy`, QEMU's `qemu-img` and `qemu-io`), and the client
+against `qemu-nbd`, with and without TLS. Install them first; on Debian and
+Ubuntu that is `apt install libnbd-bin qemu-utils`.
 
 ## License
 
