@@ -90,8 +90,12 @@ impl Client {
 fn read_only_disk() -> (NamedTempFile, Server) {
     let image = NamedTempFile::new().unwrap();
     image.as_file().set_len(1 << 20).unwrap();
-    let backend = FileBackend::open(image.path(), Access::ReadOnly).unwrap();
-    (image, Server::new().export("disk", Arc::new(backend)))
+    let server = Server::new();
+    server.export(
+        "disk",
+        Arc::new(FileBackend::open(image.path(), Access::ReadOnly).unwrap()),
+    );
+    (image, server)
 }
 
 #[tokio::test]
@@ -107,7 +111,7 @@ async fn unknown_options_are_refused_and_negotiation_goes_on() {
 #[tokio::test]
 async fn options_before_starttls_need_tls() {
     let certs = TempDir::new().unwrap();
-    let mut client = Client::connect(Server::with_tls(common::tls(certs.path()))).await;
+    let mut client = Client::connect(Server::with_tls(common::tls(certs.path()).acceptor)).await;
     client.option(OPT_GO, &[0, 0, 0, 0, 0, 0]).await;
     let (option, kind, _) = client.option_reply().await;
     assert_eq!((option, kind), (OPT_GO, REP_ERR_TLS_REQD));

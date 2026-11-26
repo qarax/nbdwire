@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_rustls::TlsAcceptor;
@@ -39,10 +39,12 @@ fn protocol(message: impl Into<String>) -> Error {
 }
 
 /// An NBD server: named exports, each served to one client per
-/// [`serve`](Self::serve) call.
+/// [`serve`](Self::serve) call. Exports come and go while it serves: a
+/// client picks from those there when it asks for one, and keeps its own
+/// for as long as it is connected.
 #[derive(Default)]
 pub struct Server {
-    exports: BTreeMap<String, Arc<dyn Backend>>,
+    exports: RwLock<BTreeMap<String, Arc<dyn Backend>>>,
     tls: Option<TlsAcceptor>,
 }
 
@@ -58,15 +60,29 @@ impl Server {
     /// decides whether clients need certificates.
     pub fn with_tls(acceptor: TlsAcceptor) -> Self {
         Self {
-            exports: BTreeMap::new(),
+            exports: RwLock::default(),
             tls: Some(acceptor),
         }
     }
 
-    /// Serve `backend` as `name`.
-    pub fn export(mut self, name: impl Into<String>, backend: Arc<dyn Backend>) -> Self {
-        self.exports.insert(name.into(), backend);
-        self
+    /// Serve `backend` as `name` to clients that ask for it from now on.
+    /// Returns the export it replaces.
+    pub fn export(
+        &self,
+        name: impl Into<String>,
+        backend: Arc<dyn Backend>,
+    ) -> Option<Arc<dyn Backend>> {
+        self.exports.write().unwrap().insert(name.into(), backend)
+    }
+
+    /// Stop offering `name` to clients. Those connected to it keep it until
+    /// they disconnect. Returns the export, if there was one.
+    pub fn unexport(&self, name: &str) -> Option<Arc<dyn Backend>> {
+        self.exports.write().unwrap().remove(name)
+    }
+
+    fn get_export(&self, name: &str) -> Option<Arc<dyn Backend>> {
+        self.exports.read().unwrap().get(name).cloned()
     }
 
     /// Serve one client on `stream` until it disconnects.
@@ -137,14 +153,10 @@ impl Server {
                     let name = proto::parse_export_name(&data)
                         .map_err(|e| protocol(format!("NBD_OPT_EXPORT_NAME: {e}")))?;
                     let backend = self
-                        .exports
-                        .get(&name)
+                        .get_export(&name)
                         .ok_or_else(|| protocol(format!("no export named {name:?}")))?;
-                    let session = Session::new(
-                        backend.clone(),
-                        structured,
-                        selected.as_deref() == Some(&name),
-                    );
+                    let session =
+                        Session::new(backend, structured, selected.as_deref() == Some(&name));
                     let reply = proto::export_name_reply(session.size, session.flags(), no_zeroes);
                     send(stream, &reply).await?;
                     return Ok(Some(session));
@@ -158,8 +170,9 @@ impl Server {
                     if !data.is_empty() {
                         refuse!(OptError::Invalid, "NBD_OPT_LIST takes no data");
                     }
+                    let names: Vec<String> = self.exports.read().unwrap().keys().cloned().collect();
                     let mut out = Vec::new();
-                    for name in self.exports.keys() {
+                    for name in &names {
                         out.extend(proto::option_reply(
                             code,
                             rep::SERVER,
@@ -178,14 +191,14 @@ impl Server {
                         Ok(request) => request,
                         Err(e) => refuse!(OptError::Invalid, e.to_string()),
                     };
-                    let Some(backend) = self.exports.get(&request.export) else {
+                    let Some(backend) = self.get_export(&request.export) else {
                         refuse!(
                             OptError::Unknown,
                             format!("no export named {:?}", request.export)
                         );
                     };
                     let session = Session::new(
-                        backend.clone(),
+                        backend,
                         structured,
                         selected.as_deref() == Some(&request.export),
                     );
@@ -232,7 +245,7 @@ impl Server {
                         Ok(request) => request,
                         Err(e) => refuse!(OptError::Invalid, e.to_string()),
                     };
-                    if !self.exports.contains_key(&request.export) {
+                    if self.get_export(&request.export).is_none() {
                         refuse!(
                             OptError::Unknown,
                             format!("no export named {:?}", request.export)

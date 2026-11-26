@@ -51,6 +51,21 @@ pub enum Opt {
 }
 
 impl Opt {
+    /// The option's code on the wire.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::ExportName => 1,
+            Self::Abort => 2,
+            Self::List => 3,
+            Self::StartTls => 5,
+            Self::Info => 6,
+            Self::Go => 7,
+            Self::StructuredReply => 8,
+            Self::ListMetaContext => 9,
+            Self::SetMetaContext => 10,
+        }
+    }
+
     /// The option `code` stands for, or `None` for one this crate doesn't
     /// know, which a server refuses with [`OptError::Unsup`].
     pub fn from_code(code: u32) -> Option<Self> {
@@ -90,6 +105,11 @@ pub enum OptError {
     TlsReqd,
     /// There is no export by that name.
     Unknown,
+}
+
+/// Whether an option reply's type is an error.
+pub fn is_option_error(reply_type: u32) -> bool {
+    reply_type & (1 << 31) != 0
 }
 
 impl OptError {
@@ -146,6 +166,21 @@ pub enum Cmd {
 }
 
 impl Cmd {
+    /// The command's code on the wire.
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+            Self::Disc => 2,
+            Self::Flush => 3,
+            Self::Trim => 4,
+            Self::Cache => 5,
+            Self::WriteZeroes => 6,
+            Self::BlockStatus => 7,
+            Self::Resize => 8,
+        }
+    }
+
     /// The command `code` stands for, or `None` for one this crate doesn't know.
     pub fn from_code(code: u16) -> Option<Self> {
         Some(match code {
@@ -546,6 +581,182 @@ pub fn block_status_chunk(cookie: u64, context_id: u32, descriptors: &[Descripto
     out
 }
 
+// What a client writes and reads.
+
+/// The server's greeting: its handshake flags.
+pub fn parse_greeting(buf: &[u8; 18]) -> Result<u16, ParseError> {
+    let mut reader = Reader(buf);
+    if reader.u64()? != NBD_MAGIC || reader.u64()? != IHAVEOPT {
+        return Err(ParseError::Magic);
+    }
+    reader.u16()
+}
+
+/// An option, as a client sends it.
+pub fn option_request(option: Opt, data: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(data.len()).expect("options are small");
+    let mut out = Vec::with_capacity(OPTION_HEADER_LEN + data.len());
+    out.extend_from_slice(&IHAVEOPT.to_be_bytes());
+    out.extend_from_slice(&option.code().to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// The data of `NBD_OPT_INFO` and `NBD_OPT_GO`.
+pub fn info_request(export: &str, requests: &[u16]) -> Vec<u8> {
+    let mut out = length_prefixed(export);
+    let count = u16::try_from(requests.len()).expect("a few information types");
+    out.extend_from_slice(&count.to_be_bytes());
+    for request in requests {
+        out.extend_from_slice(&request.to_be_bytes());
+    }
+    out
+}
+
+/// The data of `NBD_OPT_LIST_META_CONTEXT` and `NBD_OPT_SET_META_CONTEXT`.
+pub fn meta_context_request(export: &str, queries: &[&str]) -> Vec<u8> {
+    let mut out = length_prefixed(export);
+    let count = u32::try_from(queries.len()).expect("a few queries");
+    out.extend_from_slice(&count.to_be_bytes());
+    for query in queries {
+        out.extend(length_prefixed(query));
+    }
+    out
+}
+
+/// The length of the header of a reply to an option.
+pub const OPTION_REPLY_HEADER_LEN: usize = 20;
+
+/// The header of a reply to an option: the option, the reply's type and the
+/// length of the payload after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionReplyHeader {
+    pub option: u32,
+    pub reply_type: u32,
+    pub length: u32,
+}
+
+pub fn parse_option_reply_header(
+    buf: &[u8; OPTION_REPLY_HEADER_LEN],
+) -> Result<OptionReplyHeader, ParseError> {
+    let mut reader = Reader(buf);
+    if reader.u64()? != OPTION_REPLY_MAGIC {
+        return Err(ParseError::Magic);
+    }
+    Ok(OptionReplyHeader {
+        option: reader.u32()?,
+        reply_type: reader.u32()?,
+        length: reader.u32()?,
+    })
+}
+
+/// An `NBD_REP_INFO` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Info {
+    Export {
+        size: u64,
+        flags: u16,
+    },
+    /// Information this crate doesn't use, by its type.
+    Other(u16),
+}
+
+pub fn parse_info(payload: &[u8]) -> Result<Info, ParseError> {
+    let mut reader = Reader(payload);
+    match reader.u16()? {
+        info::EXPORT => {
+            let (size, flags) = (reader.u64()?, reader.u16()?);
+            reader.finish()?;
+            Ok(Info::Export { size, flags })
+        }
+        other => Ok(Info::Other(other)),
+    }
+}
+
+/// An `NBD_REP_META_CONTEXT` payload: the context's ID and name.
+pub fn parse_meta_context(payload: &[u8]) -> Result<(u32, String), ParseError> {
+    let mut reader = Reader(payload);
+    let id = reader.u32()?;
+    Ok((id, reader.rest_string()?))
+}
+
+/// A request's header, as a client sends it; a write's data follows.
+pub fn request(
+    flags: u16,
+    cmd: Cmd,
+    cookie: u64,
+    offset: u64,
+    length: u32,
+) -> [u8; REQUEST_HEADER_LEN] {
+    let mut out = [0; REQUEST_HEADER_LEN];
+    out[..4].copy_from_slice(&REQUEST_MAGIC.to_be_bytes());
+    out[4..6].copy_from_slice(&flags.to_be_bytes());
+    out[6..8].copy_from_slice(&cmd.code().to_be_bytes());
+    out[8..16].copy_from_slice(&cookie.to_be_bytes());
+    out[16..24].copy_from_slice(&offset.to_be_bytes());
+    out[24..].copy_from_slice(&length.to_be_bytes());
+    out
+}
+
+/// The header of a structured reply chunk, after its magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHeader {
+    pub flags: u16,
+    pub kind: u16,
+    pub cookie: u64,
+    pub length: u32,
+}
+
+pub fn parse_chunk_header(buf: &[u8; CHUNK_HEADER_LEN - 4]) -> Result<ChunkHeader, ParseError> {
+    let mut reader = Reader(buf);
+    Ok(ChunkHeader {
+        flags: reader.u16()?,
+        kind: reader.u16()?,
+        cookie: reader.u64()?,
+        length: reader.u32()?,
+    })
+}
+
+/// Whether a chunk's type is an error.
+pub fn is_error_chunk(kind: u16) -> bool {
+    kind & (1 << 15) != 0
+}
+
+/// An `NBD_REPLY_TYPE_OFFSET_HOLE` payload: where the hole starts and its
+/// length.
+pub fn parse_offset_hole(payload: &[u8]) -> Result<(u64, u32), ParseError> {
+    let mut reader = Reader(payload);
+    let hole = (reader.u64()?, reader.u32()?);
+    reader.finish()?;
+    Ok(hole)
+}
+
+/// An `NBD_REPLY_TYPE_BLOCK_STATUS` payload: the context's ID and its
+/// extents.
+pub fn parse_block_status(payload: &[u8]) -> Result<(u32, Vec<Descriptor>), ParseError> {
+    let mut reader = Reader(payload);
+    let id = reader.u32()?;
+    let mut descriptors = Vec::with_capacity(reader.0.len() / 8);
+    while !reader.0.is_empty() {
+        descriptors.push(Descriptor {
+            length: reader.u32()?,
+            flags: reader.u32()?,
+        });
+    }
+    Ok((id, descriptors))
+}
+
+/// An error chunk's payload (`NBD_REPLY_TYPE_ERROR`, or
+/// `NBD_REPLY_TYPE_ERROR_OFFSET` with an offset after it): the error and its
+/// message.
+pub fn parse_error_chunk(payload: &[u8]) -> Result<(u32, String), ParseError> {
+    let mut reader = Reader(payload);
+    let error = reader.u32()?;
+    let len = reader.u16()?;
+    Ok((error, reader.string(u32::from(len))?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +852,32 @@ mod tests {
                 queries: vec![BASE_ALLOCATION.into()],
             })
         );
+    }
+
+    #[test]
+    fn a_block_status_payload_needs_whole_descriptors() {
+        let mut payload = 7u32.to_be_bytes().to_vec();
+        for (length, flags) in [(4096u32, 0u32), (8192, allocation::HOLE | allocation::ZERO)] {
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(&flags.to_be_bytes());
+        }
+        let (id, descriptors) = parse_block_status(&payload).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(
+            descriptors,
+            [
+                Descriptor {
+                    length: 4096,
+                    flags: 0
+                },
+                Descriptor {
+                    length: 8192,
+                    flags: 3
+                },
+            ]
+        );
+        payload.pop();
+        assert_eq!(parse_block_status(&payload), Err(ParseError::Truncated));
     }
 
     #[test]
